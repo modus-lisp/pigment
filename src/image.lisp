@@ -2,7 +2,7 @@
 ;;;;
 ;;;; Enough to paint real image sources (an <img src="data:...">, a CSS data-URI
 ;;;; background, or bytes off the network): a base64 decoder, a data-URI
-;;;; splitter, a PNG decoder (IHDR/PLTE/tRNS/IDAT via chipz inflate, scanline
+;;;; splitter, a PNG decoder (IHDR/PLTE/tRNS/IDAT via cram zlib inflate, scanline
 ;;;; unfiltering, color types 0/2/3/4/6, Adam7), a minimal GIF87a/89a decoder, a
 ;;;; WebP wrapper, and an SVG path rendered through stencil.  Returns an IMG
 ;;;; struct (w h rgba) where rgba is a (w*h*4) octet vector, straight-alpha.
@@ -81,7 +81,7 @@ leaves '+' literal — data: URIs are not form-encoded)."
             ((string= type "IEND") (return)))
           (setf i (+ ds len 4))))   ; skip CRC
       (when (and w h depth ctype (only-supported-p depth ctype))
-        ;; chipz needs a SIMPLE array; COERCE leaves an adjustable/fill-pointer
+        ;; the inflater wants a SIMPLE array; COERCE leaves an adjustable/fill-pointer
         ;; vector unchanged, so build a fresh simple-array of the bytes.
         (png-finish w h depth ctype
                     (replace (make-array (length idat) :element-type '(unsigned-byte 8)) idat)
@@ -155,7 +155,7 @@ indices (ctype 3) are kept as-is."
 (defun png-finish (w h depth ctype idat plte trns interlace)
   (let* ((ch (channels ctype)) (sub8 (< depth 8))
          (stride (if sub8 (ceiling (* w depth) 8) (* w ch)))
-         (raw (handler-case (chipz:decompress nil 'chipz:zlib idat) (error () nil))))
+         (raw (handler-case (cram:zlib-decompress idat :verify nil) (error () nil))))
     ;; sub-byte depths are only supported non-interlaced (Adam7 + <8bpp is rare).
     (when (and raw (not (and sub8 (= interlace 1)))
                (if (= interlace 1)
