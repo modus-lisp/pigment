@@ -234,14 +234,16 @@ background-filled canvas size so layout at least gets dimensions)."
             (map 'string #'code-char (base64-decode payload))
             (percent-decode payload))))))
 
-(defun decode-svg-source (src)
-  "Render an SVG source string through stencil to a straight-alpha IMG at the SVG's
-   intrinsic size, or NIL."
+(defun decode-svg-source (src &key width height)
+  "Render an SVG source string through stencil to a straight-alpha IMG.  With WIDTH
+   and/or HEIGHT, rasterise at that size — SVG is vector, so it's crisp at any size
+   (the viewBox is fitted into the box per preserveAspectRatio); otherwise at the
+   SVG's intrinsic size.  NIL on failure."
   (when (and src (plusp (length src)))
     (let ((root (ignore-errors (st:parse-svg src))))
       (when root
         (multiple-value-bind (iw ih) (st:svg-intrinsic-size root)
-          (let* ((w (max 1 (round iw))) (h (max 1 (round ih)))
+          (let* ((w (max 1 (round (or width iw)))) (h (max 1 (round (or height ih))))
                  (cv (sc:make-rgba-canvas w h)))
             (ignore-errors (st:render-svg-to-canvas root :width w :height h :canvas cv))
             (let ((img (rgba-canvas->img cv)))
@@ -290,13 +292,14 @@ background-filled canvas size so layout at least gets dimensions)."
                 (aref rgba (+ (* i 4) 3)) 255))
         (make-img :w w :h h :rgba rgba)))))
 
-(defun decode-image-bytes (bytes &optional mime)
+(defun decode-image-bytes (bytes &optional mime &key width height)
   "Decode raw image BYTES (from a network fetch, not a data: URI) to an IMG, or NIL.
-   Dispatches on MIME when given, else on the leading magic bytes."
+   Dispatches on MIME when given, else on the leading magic bytes.  WIDTH/HEIGHT (if
+   given) rasterise an SVG at that size; raster formats ignore them (fixed size)."
   (when (and bytes (plusp (length bytes)))
     (cond
       ((and mime (search "svg" mime :test #'char-equal))
-       (decode-svg-source (map 'string #'code-char bytes)))
+       (decode-svg-source (map 'string #'code-char bytes) :width width :height height))
       ((and (>= (length bytes) 8) (= (aref bytes 0) 137) (= (aref bytes 1) 80)) (png-decode bytes))
       ((and (>= (length bytes) 2) (= (aref bytes 0) #xff) (= (aref bytes 1) #xd8)) (jpeg-decode bytes))
       ((webp-pure:webp-p bytes) (ignore-errors (webp-to-img bytes)))
@@ -305,5 +308,5 @@ background-filled canvas size so layout at least gets dimensions)."
       ((and mime (search "png" mime :test #'char-equal)) (png-decode bytes))
       ((and mime (or (search "jpeg" mime :test #'char-equal) (search "jpg" mime :test #'char-equal))) (jpeg-decode bytes))
       ((and mime (search "gif" mime :test #'char-equal)) (gif-decode bytes))
-      ((svg-bytes-p bytes) (decode-svg-source (map 'string #'code-char bytes)))
+      ((svg-bytes-p bytes) (decode-svg-source (map 'string #'code-char bytes) :width width :height height))
       (t nil))))
