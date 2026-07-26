@@ -222,6 +222,7 @@
           (qt (make-array 4 :initial-element nil))     ; 4 quant tables, NATURAL order
           (dht (make-array 4 :initial-element nil)) (aht (make-array 4 :initial-element nil))
           (w 0) (h 0) (comps nil) (ri 0) (hmax 1) (vmax 1) (mx 0) (my 0)
+          (adobe nil)          ; APP14 Adobe colour transform: NIL / 0 / 1 / 2, else :seen
           (br nil) (spatial (make-array 64 :element-type 'double-float))
           (fblock (make-array 64 :element-type 'double-float)))
       (labels
@@ -331,6 +332,14 @@
                    (ignore-errors (decode-scan sos-i))
                    ;; resume marker parsing right after the entropy segment.
                    (setf i (if (and br (> (jbr-pos br) sos-i)) (jbr-pos br) (+ sos-i (j16 bytes i))))))
+                ((= m #xee)                                                 ; APP14 (Adobe colour transform)
+                 (let ((len (j16 bytes i)))
+                   (when (and (>= len 14)
+                              (= (aref bytes (+ i 2)) 65) (= (aref bytes (+ i 3)) 100) ; "Ad"
+                              (= (aref bytes (+ i 4)) 111) (= (aref bytes (+ i 5)) 98) ; "ob"
+                              (= (aref bytes (+ i 6)) 101))                            ; "e"
+                     (setf adobe (aref bytes (+ i 13))))                              ; transform byte
+                   (incf i len)))
                 (t (incf i (j16 bytes i))))))))                              ; APPn / COM / …
       (when (or (zerop w) (zerop h) (null comps)) (return-from jpeg-decode nil))
       ;; ---- dequantise + IDCT into per-component planes ----
@@ -351,19 +360,52 @@
                             (clamp8 (+ (aref spatial (+ (* yy 8) xx)) 128d0)))))))))
           (setf (jcomp-coef c) plane (jcomp-bpl c) cw)))    ; reuse slots: coef->plane, bpl->plane width
       ;; ---- compose RGBA (upsample chroma by replication) ----
-      (let ((out (make-array (* w h 4) :element-type '(unsigned-byte 8)))
-            (c0 (first comps)) (c1 (second comps)) (c2 (third comps)))
+      (let* ((nc (length comps))
+             (out (make-array (* w h 4) :element-type '(unsigned-byte 8)))
+             (c0 (first comps)) (c1 (second comps)) (c2 (third comps)) (c3 (fourth comps))
+             ;; a 3-component frame is YCbCr unless an Adobe APP14 marker says 0 (RGB).
+             ;; a 4-component frame is CMYK (transform 0) or YCCK (transform 2); Adobe
+             ;; stores CMYK/YCCK inverted, so the true colour is C_stored*K_stored/255.
+             (ycc3 (and (= nc 3) (not (eql adobe 0))))
+             (ycck (and (= nc 4) (eql adobe 2)))
+             (cmyk-inv (and (= nc 4) adobe)))       ; Adobe present => inverted CMYK
         (dotimes (py h)
           (dotimes (px w)
             (flet ((samp (c) (aref (jcomp-coef c)
                                    (+ (* (floor (* py (jcomp-v c)) vmax) (jcomp-bpl c))
                                       (floor (* px (jcomp-h c)) hmax)))))
               (let ((o (* (+ (* py w) px) 4)))
-                (if (and c1 c2)
-                    (let* ((yy (samp c0)) (cb (- (samp c1) 128)) (cr (- (samp c2) 128)))
-                      (setf (aref out o)       (clamp8 (+ yy (* 1.402d0 cr)))
-                            (aref out (+ o 1)) (clamp8 (- yy (* 0.344136d0 cb) (* 0.714136d0 cr)))
-                            (aref out (+ o 2)) (clamp8 (+ yy (* 1.772d0 cb)))))
-                    (let ((g (samp c0))) (setf (aref out o) g (aref out (+ o 1)) g (aref out (+ o 2)) g)))
+                (cond
+                  ;; ---- 4-component CMYK / YCCK ----
+                  ((= nc 4)
+                   (let (ci mi yi ki)
+                     (if ycck
+                         ;; YCCK: YCbCr -> RGB gives the (inverted) CMY directly; K is comp3.
+                         (let ((yy (samp c0)) (cb (- (samp c1) 128)) (cr (- (samp c2) 128)))
+                           (setf ci (clamp8 (+ yy (* 1.402d0 cr)))
+                                 mi (clamp8 (- yy (* 0.344136d0 cb) (* 0.714136d0 cr)))
+                                 yi (clamp8 (+ yy (* 1.772d0 cb)))
+                                 ki (samp c3)))
+                         (setf ci (samp c0) mi (samp c1) yi (samp c2) ki (samp c3)))
+                     (if cmyk-inv
+                         ;; inverted CMYK (Adobe): R = C_stored * K_stored / 255
+                         (setf (aref out o)       (floor (* ci ki) 255)
+                               (aref out (+ o 1)) (floor (* mi ki) 255)
+                               (aref out (+ o 2)) (floor (* yi ki) 255))
+                         ;; plain CMYK: R = (255-C)(255-K)/255
+                         (setf (aref out o)       (floor (* (- 255 ci) (- 255 ki)) 255)
+                               (aref out (+ o 1)) (floor (* (- 255 mi) (- 255 ki)) 255)
+                               (aref out (+ o 2)) (floor (* (- 255 yi) (- 255 ki)) 255)))))
+                  ;; ---- 3-component YCbCr ----
+                  (ycc3
+                   (let ((yy (samp c0)) (cb (- (samp c1) 128)) (cr (- (samp c2) 128)))
+                     (setf (aref out o)       (clamp8 (+ yy (* 1.402d0 cr)))
+                           (aref out (+ o 1)) (clamp8 (- yy (* 0.344136d0 cb) (* 0.714136d0 cr)))
+                           (aref out (+ o 2)) (clamp8 (+ yy (* 1.772d0 cb))))))
+                  ;; ---- 3-component RGB (Adobe transform 0) ----
+                  ((= nc 3)
+                   (setf (aref out o) (samp c0) (aref out (+ o 1)) (samp c1) (aref out (+ o 2)) (samp c2)))
+                  ;; ---- 1-component grayscale ----
+                  (t (let ((g (samp c0))) (setf (aref out o) g (aref out (+ o 1)) g (aref out (+ o 2)) g))))
                 (setf (aref out (+ o 3)) 255)))))
         (make-img :w w :h h :rgba out)))))
