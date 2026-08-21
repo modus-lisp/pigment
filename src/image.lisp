@@ -372,15 +372,21 @@ indices (ctype 3) are kept as-is."
                  (t (return nil)))))
 
 (defun webp-to-img (bytes)
-  "Decode a WebP (VP8) via webp-pure into an opaque RGBA IMG, or NIL."
-  (multiple-value-bind (w h rgb) (webp-pure:decode bytes)
+  "Decode a WebP (VP8 lossy or VP8L lossless) via webp-pure into an RGBA IMG, or NIL.
+
+   The ALPHA plane is webp-pure's FOURTH value and NIL when the image is opaque.
+   This hardcoded 255 and dropped it, which was invisible while only lossy VP8
+   decoded — VP8 has no alpha — and became a silent bug the moment VP8L landed,
+   since a lossless WebP routinely carries transparency and would have come out
+   with its transparent regions painted solid."
+  (multiple-value-bind (w h rgb alpha) (webp-pure:decode bytes)
     (when (and w h rgb (plusp w) (plusp h))
       (let ((rgba (make-array (* w h 4) :element-type '(unsigned-byte 8))))
         (dotimes (i (* w h))
           (setf (aref rgba (* i 4))       (aref rgb (* i 3))
                 (aref rgba (+ (* i 4) 1)) (aref rgb (+ (* i 3) 1))
                 (aref rgba (+ (* i 4) 2)) (aref rgb (+ (* i 3) 2))
-                (aref rgba (+ (* i 4) 3)) 255))
+                (aref rgba (+ (* i 4) 3)) (if alpha (aref alpha i) 255)))
         (make-img :w w :h h :rgba rgba)))))
 
 (defun decode-image-bytes (bytes &optional mime &key width height)
