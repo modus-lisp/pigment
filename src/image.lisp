@@ -199,14 +199,105 @@ indices (ctype 3) are kept as-is."
     (cond ((and (<= pa pb) (<= pa pc)) a) ((<= pb pc) b) (t c))))
 
 ;;; ---- GIF (minimal, first frame, global palette) ------------------------
+;;; ---- GIF ---------------------------------------------------------------
+;;;
+;;; This decoded nothing.  It read the logical-screen width and height out of the
+;;; header and returned a canvas of that size with every pixel at alpha 0 — the
+;;; docstring said "LZW omitted" and meant it.  The dimensions were right, so a
+;;; caller doing layout saw a correctly sized image and painted a hole, and nothing
+;;; anywhere reported a failure: 4096 of 4096 pixels transparent is not an error, it
+;;; is a picture of nothing.  Found downstream, by an SVG conformance run whose
+;;; <image> tests came out blank against a reference full of colour.
+;;;
+;;; The COMPRESSION is not here — CRAM:LZW-DECODE has it, next to the DEFLATE that
+;;; PNG uses, because a codec that lives inside the one image format that first
+;;; needed it gets written again by the next one.  What is left here is the part
+;;; that really is GIF: the block structure, the colour tables, the transparent
+;;; index, and interlacing.
+
+(defparameter +gif-interlace+ '((0 8) (4 8) (2 4) (1 2))
+  "GIF's four interlace passes as (first-row row-step).")
+
 (defun gif-decode (bytes)
-  "Minimal GIF decode -> IMG, or NIL (uncompressed/LZW omitted; returns the
-background-filled canvas size so layout at least gets dimensions)."
-  (when (and (>= (length bytes) 10) (= (aref bytes 0) 71) (= (aref bytes 1) 73))   ; "GI"
-    (let ((w (logior (aref bytes 6) (ash (aref bytes 7) 8)))
-          (h (logior (aref bytes 8) (ash (aref bytes 9) 8))))
-      (when (and (plusp w) (plusp h))
-        (make-img :w w :h h :rgba (make-array (* w h 4) :element-type '(unsigned-byte 8) :initial-element 0))))))
+  "Decode a GIF87a/89a to an IMG (the FIRST frame; an animation's later frames are
+   ignored), or NIL.  Honours the global and local colour tables, the graphic
+   control extension's transparent index, and interlacing."
+  (when (and (>= (length bytes) 13) (= (aref bytes 0) 71) (= (aref bytes 1) 73)
+             (= (aref bytes 2) 70))                                    ; "GIF"
+    (let* ((sw (logior (aref bytes 6) (ash (aref bytes 7) 8)))
+           (sh (logior (aref bytes 8) (ash (aref bytes 9) 8)))
+           (flags (aref bytes 10))
+           (gct-p (logbitp 7 flags))
+           (gct-size (ash 2 (logand flags 7)))
+           (pos 13)
+           (gct nil)
+           (transparent nil))
+      (when (or (zerop sw) (zerop sh)) (return-from gif-decode nil))
+      (when gct-p
+        (setf gct (subseq bytes pos (+ pos (* 3 gct-size))))
+        (incf pos (* 3 gct-size)))
+      (loop
+        (when (>= pos (length bytes)) (return-from gif-decode nil))
+        (let ((marker (aref bytes pos)))
+          (cond
+            ;; Extension block.
+            ((= marker #x21)
+             (let ((label (aref bytes (1+ pos))))
+               (incf pos 2)
+               (when (= label #xf9)                                    ; graphic control
+                 (let ((gflags (aref bytes (1+ pos))))
+                   (when (logbitp 0 gflags)
+                     (setf transparent (aref bytes (+ pos 4))))))
+               ;; Skip the sub-block chain whatever the label was.
+               (loop for n = (aref bytes pos)
+                     do (incf pos (1+ n))
+                     until (zerop n))))
+            ;; Image descriptor — the first one is the frame we return.
+            ((= marker #x2c)
+             (let* ((ix (logior (aref bytes (+ pos 1)) (ash (aref bytes (+ pos 2)) 8)))
+                    (iy (logior (aref bytes (+ pos 3)) (ash (aref bytes (+ pos 4)) 8)))
+                    (iw (logior (aref bytes (+ pos 5)) (ash (aref bytes (+ pos 6)) 8)))
+                    (ih (logior (aref bytes (+ pos 7)) (ash (aref bytes (+ pos 8)) 8)))
+                    (iflags (aref bytes (+ pos 9)))
+                    (lct-p (logbitp 7 iflags))
+                    (interlaced (logbitp 6 iflags))
+                    (lct-size (ash 2 (logand iflags 7)))
+                    (table gct))
+               (incf pos 10)
+               (when lct-p
+                 (setf table (subseq bytes pos (+ pos (* 3 lct-size))))
+                 (incf pos (* 3 lct-size)))
+               (when (or (null table) (zerop iw) (zerop ih)) (return-from gif-decode nil))
+               (let ((min-code-size (aref bytes pos)))
+                 (incf pos)
+                 (multiple-value-bind (idx)
+                     (cram:lzw-decode bytes :start pos :min-code-size min-code-size
+                                            :limit (* iw ih) :variant :gif)
+                   (let ((rgba (make-array (* sw sh 4) :element-type '(unsigned-byte 8)
+                                                       :initial-element 0))
+                         (src 0))
+                     (flet ((put (row)
+                              (dotimes (col iw)
+                                (when (< src (length idx))
+                                  (let* ((i (aref idx src))
+                                         (x (+ ix col)) (y (+ iy row)))
+                                    (incf src)
+                                    (when (and (< x sw) (< y sh)
+                                               (not (and transparent (= i transparent))))
+                                      (let ((d (* 4 (+ x (* y sw))))
+                                            (p (* 3 i)))
+                                        (when (< (+ p 2) (length table))
+                                          (setf (aref rgba d)       (aref table p)
+                                                (aref rgba (+ d 1)) (aref table (+ p 1))
+                                                (aref rgba (+ d 2)) (aref table (+ p 2))
+                                                (aref rgba (+ d 3)) 255)))))))))
+                       (if interlaced
+                           (loop for (start step) in +gif-interlace+
+                                 do (loop for row from start below ih by step do (put row)))
+                           (dotimes (row ih) (put row))))
+                     (return-from gif-decode (make-img :w sw :h sh :rgba rgba)))))))
+            ;; Trailer, or anything unrecognised.
+            (t (return-from gif-decode nil))))))))
 
 ;;; ---- SVG (rendered through stencil to a straight-alpha bitmap) ----------
 (defun rgba-canvas->img (cv)
