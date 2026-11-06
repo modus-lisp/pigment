@@ -181,27 +181,34 @@
 ;;; ---- inverse DCT ---------------------------------------------------------
 (defun idct-8x8 (block out)
   "Separable inverse DCT of the 64-double coefficient BLOCK into OUT (spatial)."
-  (let ((tmp (make-array 64 :element-type 'double-float)))
+  (declare (type (simple-array double-float (64)) block out) (optimize speed (safety 0)))
+  (let ((tmp (make-array 64 :element-type 'double-float)) (cs +idct-cos+))
+    (declare (type (simple-array double-float (8 8)) cs) (dynamic-extent tmp))
     (dotimes (r 8)                                   ; rows
       (dotimes (x 8)
         (let ((sum 0d0))
-          (dotimes (u 8) (incf sum (* (aref block (+ (* r 8) u)) (aref +idct-cos+ x u))))
+          (declare (type double-float sum))
+          (dotimes (u 8) (incf sum (* (aref block (+ (* r 8) u)) (aref cs x u))))
           (setf (aref tmp (+ (* r 8) x)) (* 0.5d0 sum)))))
     (dotimes (c 8)                                   ; columns
       (dotimes (y 8)
         (let ((sum 0d0))
-          (dotimes (v 8) (incf sum (* (aref tmp (+ (* v 8) c)) (aref +idct-cos+ y v))))
+          (declare (type double-float sum))
+          (dotimes (v 8) (incf sum (* (aref tmp (+ (* v 8) c)) (aref cs y v))))
           (setf (aref out (+ (* y 8) c)) (* 0.5d0 sum)))))))
 
 (declaim (inline clamp8))
-(defun clamp8 (x) (cond ((< x 0d0) 0) ((> x 255d0) 255) (t (round x))))
+(defun clamp8 (x)
+  (declare (type double-float x))
+  (cond ((< x 0d0) 0) ((> x 255d0) 255) (t (values (round x)))))
 
 ;;; ---- top level -----------------------------------------------------------
 (defstruct jcomp id h v qsel coef bpl bh (pred 0))   ; coef: natural-order (s16) blocks
 
-(defun jpeg-size (bytes)
+(defun jpeg-size (bytes &key (orient t))
   "Read a JPEG's intrinsic (values WIDTH HEIGHT) from its SOF marker without
-   decoding the pixels — so a box can be reserved before/without a full decode."
+   decoding the pixels — so a box can be reserved before/without a full decode.
+   ORIENT (the default): as JPEG-DECODE shows it, turned by its EXIF orientation."
   (when (and (>= (length bytes) 3) (= (aref bytes 0) #xff) (= (aref bytes 1) #xd8))
     (let ((n (length bytes)) (i 2))
       (loop
@@ -210,13 +217,17 @@
         (when (>= i (- n 4)) (return))
         (let ((m (aref bytes i))) (incf i)
           (cond ((or (<= #xc0 m #xc3) (<= #xc5 m #xc7) (<= #xc9 m #xcb) (<= #xcd m #xcf))  ; any SOF
-                 (return-from jpeg-size (values (j16 bytes (+ i 5)) (j16 bytes (+ i 3)))))
+                 (let ((w (j16 bytes (+ i 5))) (h (j16 bytes (+ i 3))))
+                   (return-from jpeg-size
+                     (if (and orient (>= (jpeg-orientation bytes) 5)) (values h w) (values w h)))))
                 ((or (= m #xd8) (= m #xd9) (<= #xd0 m #xd7)))       ; standalone markers
                 (t (incf i (j16 bytes i)))))))
     nil))
 
-(defun jpeg-decode (bytes)
-  "Decode a baseline OR progressive JPEG byte vector to an IMG (RGBA), or NIL."
+(defun jpeg-decode (bytes &key (orient t))
+  "Decode a baseline OR progressive JPEG byte vector to an IMG (RGBA), or NIL.
+   ORIENT (the default): turned upright by its EXIF orientation, as a browser
+   shows it (CSS image-orientation: from-image); NIL: as stored."
   (when (and (>= (length bytes) 3) (= (aref bytes 0) #xff) (= (aref bytes 1) #xd8))
     (let ((n (length bytes)) (i 2)
           (qt (make-array 4 :initial-element nil))     ; 4 quant tables, NATURAL order
@@ -408,4 +419,60 @@
                   ;; ---- 1-component grayscale ----
                   (t (let ((g (samp c0))) (setf (aref out o) g (aref out (+ o 1)) g (aref out (+ o 2)) g))))
                 (setf (aref out (+ o 3)) 255)))))
-        (make-img :w w :h h :rgba out)))))
+        (let ((img (make-img :w w :h h :rgba out)))
+          (if orient (orient-img img (jpeg-orientation bytes)) img))))))
+
+;;; ---- EXIF orientation ---------------------------------------------------
+;;; A camera stores its pixels as the sensor read them and says in EXIF (tag
+;;; 0x0112, in the first APP1) how to turn them upright; a phone's portrait
+;;; photo is a landscape image with orientation 6.
+
+(defun jpeg-orientation (bytes)
+  "BYTES' EXIF orientation, 1 (as stored) to 8; 1 when it has none."
+  (let ((n (length bytes)) (i 2))
+    (loop while (and (<= (+ i 4) n) (= (aref bytes i) #xff))
+          do (let ((m (aref bytes (1+ i))))
+               (incf i 2)
+               (unless (or (= m #xd8) (<= #xd0 m #xd9))
+                 (let ((seg (j16 bytes i)))
+                   (when (or (< seg 2) (> seg (- n i))) (return))
+                   (when (and (= m #xe1) (>= seg 14)
+                              (every #'= (subseq bytes (+ i 2) (+ i 8)) '(69 120 105 102 0 0)))   ; "Exif\0\0"
+                     (let* ((tf (+ i 8)) (tlen (- seg 8))
+                            (le (and (= (aref bytes tf) 73) (= (aref bytes (1+ tf)) 73))))       ; "II"
+                       (flet ((u16 (o) (if le (logior (aref bytes o) (ash (aref bytes (1+ o)) 8)) (j16 bytes o)))
+                              (u32 (o) (let ((a (aref bytes o)) (b (aref bytes (+ o 1)))
+                                             (c (aref bytes (+ o 2))) (d (aref bytes (+ o 3))))
+                                         (if le (logior a (ash b 8) (ash c 16) (ash d 24))
+                                             (logior (ash a 24) (ash b 16) (ash c 8) d)))))
+                         (when (or (< tlen 8) (/= (u16 (+ tf 2)) 42)) (return))
+                         (let ((ifd (u32 (+ tf 4))))
+                           (when (or (> ifd tlen) (< (- tlen ifd) 2)) (return))
+                           (let ((count (u16 (+ tf ifd))))
+                             (when (> (* 12 count) (- tlen ifd 2)) (return))
+                             (dotimes (k count)
+                               (let ((e (+ tf ifd 2 (* 12 k))))
+                                 (when (and (= (u16 e) #x112) (= (u16 (+ e 2)) 3) (= (u32 (+ e 4)) 1))
+                                   (let ((o (u16 (+ e 8)))) (return-from jpeg-orientation (if (<= 1 o 8) o 1))))))
+                             (return))))))
+                   (when (= m #xda) (return))
+                   (incf i seg)))))
+    1))
+
+(defun orient-img (img orientation)
+  "IMG turned and mirrored upright by EXIF ORIENTATION (1 to 8): a new IMG, or IMG for 1."
+  (if (or (null orientation) (= orientation 1))
+      img
+      (let* ((w (img-w img)) (h (img-h img)) (src (img-rgba img))
+             (ow (if (>= orientation 5) h w)) (oh (if (>= orientation 5) w h))
+             (out (make-array (* ow oh 4) :element-type '(unsigned-byte 8))))
+        (dotimes (y h)
+          (dotimes (x w)
+            (multiple-value-bind (ox oy)
+                (case orientation
+                  (2 (values (- w 1 x) y))           (3 (values (- w 1 x) (- h 1 y)))
+                  (4 (values x (- h 1 y)))           (5 (values y x))
+                  (6 (values (- h 1 y) x))           (7 (values (- h 1 y) (- w 1 x)))
+                  (8 (values y (- w 1 x)))           (t (values x y)))
+              (replace out src :start1 (* 4 (+ ox (* oy ow))) :start2 (* 4 (+ x (* y w))) :end2 (* 4 (+ 1 x (* y w)))))))
+        (make-img :w ow :h oh :rgba out))))

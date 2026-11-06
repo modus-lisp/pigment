@@ -69,6 +69,35 @@
       (and img (equal (px img 0) '(220 20 60 255)))
       (and img (format nil "~a" (px img 0)))))
 
+;;; A 16x8 JPEG, red on its left half and blue on its right, stored as the
+;;; sensor read it with EXIF orientation 6: a browser turns it a quarter turn
+;;; clockwise, so it shows 8 wide, 16 high, red above blue.
+(defparameter *jpeg-o6* (bv
+  255 216 255 224 0 16 74 70 73 70 0 1 1 0 0 1 0 1 0 0 255 225 0 34 69 120 105 102 0 0 77 77 0 42 0 0 0 8
+  0 1 1 18 0 3 0 0 0 1 0 6 0 0 0 0 0 0 255 219 0 67 0 2 1 1 1 1 1 2 1 1 1 2 2 2 2 2 4 3 2 2 2 2 5 4 4 3 4
+  6 5 6 6 6 5 6 6 6 7 9 8 6 7 9 7 6 6 8 11 8 9 10 10 10 10 10 6 8 11 12 11 10 12 9 10 10 10 255 219 0 67 1
+  2 2 2 2 2 2 5 3 3 5 10 7 6 7 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10
+  10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 10 255 192 0 17 8 0 8 0 16 3 1
+  34 0 2 17 1 3 17 1 255 196 0 21 0 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 8 255 196 0 20 16 1 0 0 0 0 0 0 0 0
+  0 0 0 0 0 0 0 0 255 196 0 20 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 8 255 196 0 25 17 0 2 3 1 0 0 0 0 0 0 0 0
+  0 0 0 0 0 8 69 132 196 70 255 218 0 12 3 1 0 2 17 3 17 0 63 0 143 211 88 16 136 103 69 83 80 168 116 160
+  109 103 63 255 217))
+
+(format t "~&== a camera's JPEG, turned upright by its EXIF orientation ==~%")
+(let ((img (decode-image-bytes *jpeg-o6*)))
+  (ok "it decodes" img)
+  (when img
+    (ok "turned: 8 wide and 16 high" (and (= (img-w img) 8) (= (img-h img) 16))
+        (format nil "~ax~a" (img-w img) (img-h img)))
+    (flet ((reddish (p) (and (> (first p) 150) (< (third p) 90)))
+           (bluish (p) (and (> (third p) 150) (< (first p) 90))))
+      (ok "red at the top, blue at the bottom"
+          (and (reddish (px img (+ 3 (* 2 8)))) (bluish (px img (+ 3 (* 13 8)))))
+          (format nil "~a / ~a" (px img (+ 3 (* 2 8))) (px img (+ 3 (* 13 8))))))
+    (ok "its size read ahead agrees" (equal (multiple-value-list (jpeg-size *jpeg-o6*)) '(8 16)))
+    (let ((raw (jpeg-decode *jpeg-o6* :orient nil)))
+      (ok "and :orient nil leaves it as stored" (and raw (= (img-w raw) 16) (= (img-h raw) 8))))))
+
 (format t "~&== and nonsense is NIL, not a condition ==~%")
 (ok "empty input" (null (decode-image-bytes (bv))))
 (ok "eight bytes of noise" (null (decode-image-bytes (bv 1 2 3 4 5 6 7 8))))
