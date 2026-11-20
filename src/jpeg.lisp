@@ -224,16 +224,24 @@
                 (t (incf i (j16 bytes i)))))))
     nil))
 
-(defun jpeg-decode (bytes &key (orient t))
+(defun jpeg-decode (bytes &key (orient t) (scale 1))
   "Decode a baseline OR progressive JPEG byte vector to an IMG (RGBA), or NIL.
    ORIENT (the default): turned upright by its EXIF orientation, as a browser
-   shows it (CSS image-orientation: from-image); NIL: as stored."
+   shows it (CSS image-orientation: from-image); NIL: as stored.
+   SCALE 2, 4 or 8 decodes at 1/SCALE of the size, as libjpeg's scaled IDCT does: 8 is
+   each 8x8 block's DC term alone, 2 and 4 average the block's pixels.  A 3840x2160 slide
+   in a PDF shown 400 pixels wide needs 1/8 of it, and its full RGBA alone is 33 MB --
+   more than a phone's document worker has (folio's PAINT-DECODED-IMAGE asks)."
   (when (and (>= (length bytes) 3) (= (aref bytes 0) #xff) (= (aref bytes 1) #xd8))
     (let ((n (length bytes)) (i 2)
           (qt (make-array 4 :initial-element nil))     ; 4 quant tables, NATURAL order
           (dht (make-array 4 :initial-element nil)) (aht (make-array 4 :initial-element nil))
           (w 0) (h 0) (comps nil) (ri 0) (hmax 1) (vmax 1) (mx 0) (my 0)
           (adobe nil)          ; APP14 Adobe colour transform: NIL / 0 / 1 / 2, else :seen
+          (dc-only nil)        ; a BASELINE frame at 1/8: one coefficient (DC) kept per block
+          (scratch (make-array 64 :element-type '(signed-byte 16) :initial-element 0))
+          (sc (cond ((and (integerp scale) (>= scale 8)) 8) ((and (integerp scale) (>= scale 4)) 4)
+                    ((and (integerp scale) (>= scale 2)) 2) (t 1)))
           (br nil) (spatial (make-array 64 :element-type 'double-float))
           (fblock (make-array 64 :element-type 'double-float)))
       (labels
@@ -242,7 +250,7 @@
                    mx (ceiling w (* 8 hmax)) my (ceiling h (* 8 vmax)))
              (dolist (c comps)
                (setf (jcomp-bpl c) (* mx (jcomp-h c)) (jcomp-bh c) (* my (jcomp-v c))
-                     (jcomp-coef c) (make-array (* (jcomp-bpl c) (jcomp-bh c) 64)
+                     (jcomp-coef c) (make-array (* (jcomp-bpl c) (jcomp-bh c) (if dc-only 1 64))
                                                 :element-type '(signed-byte 16) :initial-element 0))))
            (decode-scan (sos-i)
              ;; parse the SOS header at SOS-I, then decode its entropy segment.
@@ -281,7 +289,12 @@
                                  (dotimes (bxi (jcomp-h c))
                                    (let ((off (* (+ (* (+ (* myi (jcomp-v c)) byi) (jcomp-bpl c))
                                                     (+ (* mxi (jcomp-h c)) bxi)) 64)))
-                                     (cond ((and (= se 63) (zerop ah)) (decode-baseline-block br dch ach c coef off))
+                                     (cond ((and dc-only (= se 63) (zerop ah))
+                                            ;; the whole block into SCRATCH, its DC kept at the block's index
+                                            (decode-baseline-block br dch ach c scratch 0)
+                                            (setf (aref coef (floor off 64)) (aref scratch 0))
+                                            (fill scratch 0))
+                                           ((and (= se 63) (zerop ah)) (decode-baseline-block br dch ach c coef off))
                                            ((zerop ah) (decode-dc-first br dch c coef off al))
                                            (t (decode-dc-refine br coef off al)))))))))
                          (incf mcu)
@@ -316,7 +329,9 @@
                      (let ((o (+ i 8 (* c 3))))
                        (push (make-jcomp :id (aref bytes o) :h (ash (aref bytes (+ o 1)) -4)
                                          :v (logand (aref bytes (+ o 1)) 15) :qsel (aref bytes (+ o 2))) comps)))
-                   (setf comps (nreverse comps))
+                   (setf comps (nreverse comps)
+                         ;; a progressive frame refines every coefficient over many scans, so it keeps them all
+                         dc-only (and (= sc 8) (/= m #xc2)))
                    (incf i (j16 bytes i))
                    (setup-frame)
                    (setf br (make-jbr :data bytes))))
@@ -353,22 +368,45 @@
                    (incf i len)))
                 (t (incf i (j16 bytes i))))))))                              ; APPn / COM / …
       (when (or (zerop w) (zerop h) (null comps)) (return-from jpeg-decode nil))
+      ;; the picture's own size at 1/SC (rounded up, as the planes are whole blocks)
+      (setf w (ceiling w sc) h (ceiling h sc))
       ;; ---- dequantise + IDCT into per-component planes ----
       (dolist (c comps)
-        (let* ((cw (* (jcomp-bpl c) 8)) (ch (* (jcomp-bh c) 8)) (coef (jcomp-coef c))
+        (let* ((bs (floor 8 sc))                 ; a block's side in the output: 8, 4, 2 or 1
+               (cw (* (jcomp-bpl c) bs)) (ch (* (jcomp-bh c) bs)) (coef (jcomp-coef c))
                (qtab (aref qt (jcomp-qsel c)))
                (plane (make-array (* cw ch) :element-type '(unsigned-byte 8) :initial-element 0)))
           (dotimes (by (jcomp-bh c))
             (dotimes (bx (jcomp-bpl c))
-              (let ((off (* (+ (* by (jcomp-bpl c)) bx) 64)))
-                (dotimes (k 64) (setf (aref fblock k) (* (coerce (aref coef (+ off k)) 'double-float)
-                                                         (coerce (aref qtab k) 'double-float))))
-                (idct-8x8 fblock spatial)
-                (let ((col (* bx 8)) (row (* by 8)))
-                  (dotimes (yy 8)
-                    (dotimes (xx 8)
-                      (setf (aref plane (+ (* (+ row yy) cw) col xx))
-                            (clamp8 (+ (aref spatial (+ (* yy 8) xx)) 128d0)))))))))
+              (let ((off (* (+ (* by (jcomp-bpl c)) bx) 64))
+                    (col (* bx bs)) (row (* by bs)))
+                (if (= sc 8)
+                    ;; the DC term alone: the block's mean, DC*Q/8 under this IDCT's scaling
+                    (setf (aref plane (+ (* row cw) col))
+                          (clamp8 (+ (/ (* (coerce (aref coef (if dc-only (floor off 64) off)) 'double-float)
+                                           (coerce (aref qtab 0) 'double-float))
+                                        8d0)
+                                     128d0)))
+                    (progn
+                      (dotimes (k 64) (setf (aref fblock k) (* (coerce (aref coef (+ off k)) 'double-float)
+                                                               (coerce (aref qtab k) 'double-float))))
+                      (idct-8x8 fblock spatial)
+                      (if (= sc 1)
+                          (dotimes (yy 8)
+                            (dotimes (xx 8)
+                              (setf (aref plane (+ (* (+ row yy) cw) col xx))
+                                    (clamp8 (+ (aref spatial (+ (* yy 8) xx)) 128d0)))))
+                          ;; 2 or 4: each output pixel the mean of an SCxSC square
+                          (let ((inv (/ 1d0 (* sc sc))))
+                            (dotimes (yy bs)
+                              (dotimes (xx bs)
+                                (let ((sum 0d0))
+                                  (declare (type double-float sum))
+                                  (dotimes (dy sc)
+                                    (dotimes (dx sc)
+                                      (incf sum (aref spatial (+ (* (+ (* yy sc) dy) 8) (* xx sc) dx)))))
+                                  (setf (aref plane (+ (* (+ row yy) cw) col xx))
+                                        (clamp8 (+ (* sum inv) 128d0)))))))))))))
           (setf (jcomp-coef c) plane (jcomp-bpl c) cw)))    ; reuse slots: coef->plane, bpl->plane width
       ;; ---- compose RGBA (upsample chroma by replication) ----
       (let* ((nc (length comps))
