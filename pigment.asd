@@ -13,4 +13,5 @@ SVG, webp-pure for WebP, cram for PNG zlib inflate)."
                 :serial t
                 :components ((:file "packages")
                              (:file "jpeg")
-                             (:file "image")))))
+                             (:file "image")
+                             (:file "png-write")))))

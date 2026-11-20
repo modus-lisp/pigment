@@ -8,7 +8,7 @@
    ;; top-level dispatchers
    #:decode-image #:decode-image-bytes
    ;; per-format decoders
-   #:png-decode #:gif-decode #:jpeg-decode #:jpeg-size #:jpeg-orientation #:orient-img #:webp-to-img
+   #:png-decode #:png-encode #:write-png #:gif-decode #:jpeg-decode #:jpeg-size #:jpeg-orientation #:orient-img #:webp-to-img
    #:decode-svg-source #:decode-svg-image #:rgba-canvas->img
    ;; helpers
    #:parse-data-uri #:base64-decode #:svg-bytes-p))
