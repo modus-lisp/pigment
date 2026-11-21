@@ -283,6 +283,40 @@
                 (setf (aref plane (+ (* (+ row y) pw) col x))
                       (clamp8i (+ (ash (+ sum 33554432) -26) 128))))))))))
 
+(defun %jpeg-ycc-to-rgba (out w h c0 c1 c2 hmax vmax)
+  "The common case of the compose pass, fast: three YCbCr planes (C0 C1 C2, each upsampled by
+   replication) into OUT as RGBA.  libjpeg's fixed point (the coefficients x 2^16, rounded) in
+   place of doubles -- on modus a double is boxed at every operation and this pass was most of a
+   4K photo's decode -- and which sample of each plane a pixel takes is found once per column
+   and per row, not per pixel."
+  (declare (type (simple-array (unsigned-byte 8) (*)) out) (fixnum w h hmax vmax))
+  (let ((p0 (jcomp-coef c0)) (p1 (jcomp-coef c1)) (p2 (jcomp-coef c2))
+        (b0 (jcomp-bpl c0)) (b1 (jcomp-bpl c1)) (b2 (jcomp-bpl c2))
+        (x0 (make-array w :element-type 'fixnum)) (x1 (make-array w :element-type 'fixnum))
+        (x2 (make-array w :element-type 'fixnum)))
+    (declare (type (simple-array (unsigned-byte 8) (*)) p0 p1 p2) (fixnum b0 b1 b2)
+             (type (simple-array fixnum (*)) x0 x1 x2))
+    (dotimes (px w)
+      (setf (aref x0 px) (floor (* px (jcomp-h c0)) hmax)
+            (aref x1 px) (floor (* px (jcomp-h c1)) hmax)
+            (aref x2 px) (floor (* px (jcomp-h c2)) hmax)))
+    (dotimes (py h)
+      (let ((r0 (* (floor (* py (jcomp-v c0)) vmax) b0))
+            (r1 (* (floor (* py (jcomp-v c1)) vmax) b1))
+            (r2 (* (floor (* py (jcomp-v c2)) vmax) b2))
+            (o (* py w 4)))
+        (declare (fixnum r0 r1 r2 o))
+        (dotimes (px w)
+          (let ((yy (aref p0 (+ r0 (aref x0 px))))
+                (cb (- (aref p1 (+ r1 (aref x1 px))) 128))
+                (cr (- (aref p2 (+ r2 (aref x2 px))) 128)))
+            (declare (fixnum yy cb cr))
+            (setf (aref out o)       (clamp8i (+ yy (ash (+ (* 91881 cr) 32768) -16)))
+                  (aref out (+ o 1)) (clamp8i (- yy (ash (+ (* 22554 cb) (* 46802 cr) 32768) -16)))
+                  (aref out (+ o 2)) (clamp8i (+ yy (ash (+ (* 116130 cb) 32768) -16)))
+                  (aref out (+ o 3)) 255)
+            (setq o (+ o 4))))))))
+
 (defun jpeg-decode (bytes &key (orient t) (scale 1))
   "Decode a baseline OR progressive JPEG byte vector to an IMG (RGBA), or NIL.
    ORIENT (the default): turned upright by its EXIF orientation, as a browser
@@ -465,6 +499,8 @@
              (ycc3 (and (= nc 3) (not (eql adobe 0))))
              (ycck (and (= nc 4) (eql adobe 2)))
              (cmyk-inv (and (= nc 4) adobe)))       ; Adobe present => inverted CMYK
+        (if ycc3
+            (%jpeg-ycc-to-rgba out w h c0 c1 c2 hmax vmax)
         (dotimes (py h)
           (dotimes (px w)
             (flet ((samp (c) (aref (jcomp-coef c)
@@ -503,7 +539,7 @@
                    (setf (aref out o) (samp c0) (aref out (+ o 1)) (samp c1) (aref out (+ o 2)) (samp c2)))
                   ;; ---- 1-component grayscale ----
                   (t (let ((g (samp c0))) (setf (aref out o) g (aref out (+ o 1)) g (aref out (+ o 2)) g))))
-                (setf (aref out (+ o 3)) 255)))))
+                (setf (aref out (+ o 3)) 255))))))
         (let ((img (make-img :w w :h h :rgba out)))
           (if orient (orient-img img (jpeg-orientation bytes)) img))))))
 
