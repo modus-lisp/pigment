@@ -256,7 +256,10 @@
     (declare (fixnum n))
     (if (= n 1)
         (setf (aref plane (+ (* row pw) col))
-              (clamp8i (+ (round (* (aref coef off) (aref qtab 0)) 8) 128)))
+              ;; the DC term over 8, rounded (half away from zero... to the nearest; ties are
+              ;; rare and either is right) -- integer only: ROUND of two fixnums was 17% of a
+              ;; page on modus
+              (clamp8i (+ (ash (+ (the fixnum (* (aref coef off) (the fixnum (svref qtab 0)))) 4) -3) 128)))
         (let ((tbl (case n (8 +jpeg-idct-8+) (4 +jpeg-idct-4+) (t +jpeg-idct-2+))))
           (declare (type simple-vector tbl))
           ;; rows: SPATIAL[v*8+x] = sum_u F(v,u) T(x,u), over the top-left N x N coefficients.
